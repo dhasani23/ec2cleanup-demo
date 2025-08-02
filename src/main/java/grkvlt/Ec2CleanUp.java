@@ -39,12 +39,10 @@ import org.jclouds.ec2.features.SecurityGroupApi;
 import org.jclouds.ec2.util.TagFilterBuilder;
 import org.jclouds.javax.annotation.Nullable;
 import org.jclouds.logging.slf4j.config.SLF4JLoggingModule;
-import org.jclouds.rest.RestContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.google.common.base.Function;
-import com.google.common.base.Optional;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Predicate;
 import com.google.common.base.Predicates;
@@ -96,12 +94,17 @@ public class Ec2CleanUp {
     public void cleanUp() throws Exception {
         EC2Api api = getEC2Api();
         try {
-            deleteKeyPairs(api.getKeyPairApi().orNull(), api.getInstanceApi().orNull());
-            deleteSecurityGroups(api.getSecurityGroupApi().orNull());
+            KeyPairApi keyPairApi = api.getKeyPairApiForRegion(region).orNull();
+            InstanceApi instanceApi = api.getInstanceApiForRegion(region).orNull();
+            SecurityGroupApi securityGroupApi = api.getSecurityGroupApiForRegion(region).orNull();
+            TagApi tagApi = api.getTagApiForRegion(region).orNull();
+            ElasticBlockStoreApi ebsApi = api.getElasticBlockStoreApiForRegion(region).orNull();
+            
+            deleteKeyPairs(keyPairApi, instanceApi);
+            deleteSecurityGroups(securityGroupApi);
 
-            Optional<? extends TagApi> tagApi = api.getTagApiForRegion(region);
-            if (tagApi.isPresent()) {
-                deleteVolumes(api.getElasticBlockStoreApi().orNull(), tagApi.get());
+            if (tagApi != null) {
+                deleteVolumes(ebsApi, tagApi);
             } else {
                 LOG.info("No tag API, not " + (check ? "checking" : "cleaning") + " volumes");
             }
@@ -123,6 +126,7 @@ public class Ec2CleanUp {
         Set<KeyPair> keys = keyPairApi.describeKeyPairsInRegion(region);
         Set<? extends Reservation<? extends RunningInstance>> instances = instanceApi.describeInstancesInRegion(region);
         Iterable<String> filtered = Iterables.filter(Iterables.transform(keys, new Function<KeyPair, String>() {
+            @Override
             public String apply(@Nullable KeyPair input) {
                 return input.getKeyName();
             }
@@ -136,7 +140,7 @@ public class Ec2CleanUp {
                 boolean notInUse = true;
 
                 for (Reservation<? extends RunningInstance> reservation : instances) {
-                    for ( RunningInstance instance : reservation) {
+                    for (RunningInstance instance : reservation) {
                         notInUse &= (!name.equals(instance.getKeyName()));
                     }
                 }
@@ -147,7 +151,7 @@ public class Ec2CleanUp {
                         deleted++;
                     } catch (Exception e) {
                         if (e.getMessage() != null && e.getMessage().contains("RequestLimitExceeded")) {
-                            Thread.sleep(1000l); // Avoid triggering rate-limiter again
+                            Thread.sleep(1000L); // Avoid triggering rate-limiter again
                         }
                         LOG.warn("Error deleting KeyPair '{}': {}", name, e.getMessage());
                     }
@@ -164,6 +168,7 @@ public class Ec2CleanUp {
 
         Set<SecurityGroup> groups = securityGroupApi.describeSecurityGroupsInRegion(region);
         Iterable<String> filtered = Iterables.filter(Iterables.transform(groups, new Function<SecurityGroup, String>() {
+            @Override
             public String apply(@Nullable SecurityGroup input) {
                 return input.getName();
             }
@@ -178,7 +183,7 @@ public class Ec2CleanUp {
                     deleted++;
                 } catch (Exception e) {
                     if (e.getMessage() != null && e.getMessage().contains("RequestLimitExceeded")) {
-                        Thread.sleep(1000l); // Avoid triggering rate-limiter again
+                        Thread.sleep(1000L); // Avoid triggering rate-limiter again
                     }
                     LOG.warn("Error deleting SecurityGroup '{}': {}", name, e.getMessage());
                 }
@@ -203,7 +208,7 @@ public class Ec2CleanUp {
                     deleted++;
                 } catch (Exception e) {
                     if (e.getMessage() != null && e.getMessage().contains("RequestLimitExceeded")) {
-                        Thread.sleep(1000l); // Avoid triggering rate-limiter again
+                        Thread.sleep(1000L); // Avoid triggering rate-limiter again
                     }
                     LOG.warn("Error deleting Volume '{}': {}", id, e.getMessage());
                 }
@@ -215,7 +220,8 @@ public class Ec2CleanUp {
     private Iterable<String> getVolumesWithNoName(ElasticBlockStoreApi ebsApi, TagApi tagApi) {
         Set<String> namedVolumes = tagApi.filter(new TagFilterBuilder().volume().key("Name").build())
                 .transform(new Function<Tag, String>() {
-                    @Override public String apply(Tag input) {
+                    @Override
+                    public String apply(Tag input) {
                         return input.getResourceId();
                     }
                 })
@@ -226,7 +232,8 @@ public class Ec2CleanUp {
                     public String apply(Volume input) {
                         if (input.getId() == null && LOG.isTraceEnabled()) LOG.trace("No id on volume: " + input);
                         return input.getId() != null ? input.getId() : null;
-                    }})
+                    }
+                })
                 .filter(Predicates.notNull())
                 .toSet();
         Set<String> unnamedVolumes = Sets.difference(allVolumes, namedVolumes);
@@ -245,13 +252,16 @@ public class Ec2CleanUp {
                 .filter(new Predicate<Tag>() {
                     @Override
                     public boolean apply(Tag input) {
-                        return Predicates.containsPattern("^" + name + "$").apply(input.getValue().orNull());
-                    }})
+                        String value = input.getValue().orNull();
+                        return value != null && Predicates.containsPattern("^" + name + "$").apply(value);
+                    }
+                })
                 .transform(new Function<Tag, String>() {
                     @Override
                     public String apply(Tag input) {
                         return input.getResourceId();
-                    }});
+                    }
+                });
         LOG.info("Found {} matching Volumes", Iterables.size(filtered));
         return filtered;
     }
@@ -274,7 +284,7 @@ public class Ec2CleanUp {
      * <p>
      * See {@code README.md} for usage example.
      */
-    public static void main(String...argv) throws Exception {
+    public static void main(String... argv) throws Exception {
         String regionParam = AWS_EUROPE;
         String regexpParam = JCLOUDS_NAME_REGEXP;
         boolean checkParam = Boolean.FALSE;
@@ -300,5 +310,4 @@ public class Ec2CleanUp {
         Ec2CleanUp cleaner = new Ec2CleanUp(regionParam, regexpParam, identityValue, credentialValue, checkParam);
         cleaner.cleanUp();
     }
-
 }
